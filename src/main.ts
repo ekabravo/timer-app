@@ -60,6 +60,8 @@ const TOUCH_SLOW_STEP_MS = 96;
 const TOUCH_FAST_STEP_MS = 16;
 const TOUCH_SLOW_TRANSITION_MS = 360;
 const TOUCH_FAST_TRANSITION_MS = 90;
+const WHEEL_RESET_QUIET_MS = 140;
+const WHEEL_RESET_MAX_SUPPRESS_MS = 900;
 const FRAME_MS = 250;
 const appRoot = document.querySelector<HTMLElement>("#app");
 
@@ -87,6 +89,10 @@ let pointerGesture: PointerGesture | null = null;
 let touchTargetIndex: number | null = null;
 let touchStepDelay = TOUCH_SLOW_STEP_MS;
 let touchStepTimeout = 0;
+let suppressWheelSelection = false;
+let suppressWheelSelectionStartedAt = 0;
+let suppressWheelTimeout = 0;
+let suppressTouchSelectionUntilPointerUp = false;
 let lastSecondKey = "";
 let lastRenderKey = "";
 let tickPulseTimeout = 0;
@@ -156,6 +162,11 @@ function bindEvents() {
     (event) => {
       if (session.mode === "selecting") {
         event.preventDefault();
+        if (suppressWheelSelection) {
+          updateWheelSelectionSuppression();
+          return;
+        }
+
         wheelRemainder += event.deltaY;
         const steps = drainSteps(wheelRemainder, STEP_WHEEL_THRESHOLD);
         if (steps !== 0) {
@@ -167,6 +178,8 @@ function bindEvents() {
 
       if (isPaused() && Math.abs(event.deltaY) > RESET_WHEEL_THRESHOLD) {
         event.preventDefault();
+        startWheelSelectionSuppression();
+        wheelRemainder = 0;
         resetToSelecting();
       }
     },
@@ -208,12 +221,18 @@ function bindEvents() {
 
       if (session.mode === "selecting") {
         event.preventDefault();
+        if (suppressTouchSelectionUntilPointerUp) {
+          return;
+        }
+
         processTouchSelectionMove(event);
         return;
       }
 
       if (isPaused() && Math.abs(event.clientY - pointerGesture.startY) > RESET_TOUCH_THRESHOLD) {
         event.preventDefault();
+        suppressTouchSelectionUntilPointerUp = true;
+        clearTouchSelectionState();
         resetToSelecting();
       }
     },
@@ -231,8 +250,10 @@ function bindEvents() {
     const wasTouchSelection =
       pointerGesture.pointerType === "touch" &&
       session.mode === "selecting" &&
+      !suppressTouchSelectionUntilPointerUp &&
       Math.hypot(dx, dy) > 14;
     pointerGesture = null;
+    suppressTouchSelectionUntilPointerUp = false;
 
     if (!wasTouchSelection || touchTargetIndex === session.selectedIndex) {
       clearTouchSelectionCue();
@@ -247,6 +268,7 @@ function bindEvents() {
 
   window.addEventListener("pointercancel", () => {
     pointerGesture = null;
+    suppressTouchSelectionUntilPointerUp = false;
     clearTouchSelectionState();
   });
 
@@ -532,10 +554,11 @@ function activate() {
 }
 
 function resetToSelecting() {
+  const selectedIndex = getResetSelectedIndex();
   session = {
     ...defaultSession(),
-    selectedIndex: session.selectedIndex,
-    selectedMinutes: selectedIndexToMinutes(session.selectedIndex)
+    selectedIndex,
+    selectedMinutes: selectedIndexToMinutes(selectedIndex)
   };
   app.classList.add("resetting");
   window.setTimeout(() => app.classList.remove("resetting"), 320);
@@ -543,6 +566,36 @@ function resetToSelecting() {
   persistSession();
   render();
   syncWakeLock();
+}
+
+function startWheelSelectionSuppression() {
+  suppressWheelSelection = true;
+  suppressWheelSelectionStartedAt = performance.now();
+  updateWheelSelectionSuppression();
+}
+
+function updateWheelSelectionSuppression() {
+  window.clearTimeout(suppressWheelTimeout);
+
+  if (performance.now() - suppressWheelSelectionStartedAt >= WHEEL_RESET_MAX_SUPPRESS_MS) {
+    suppressWheelSelection = false;
+    return;
+  }
+
+  suppressWheelTimeout = window.setTimeout(() => {
+    suppressWheelSelection = false;
+  }, WHEEL_RESET_QUIET_MS);
+}
+
+function getResetSelectedIndex() {
+  if (session.mode === "timer_paused") {
+    const remainingMs = session.pausedRemainingMs ?? session.selectedMinutes * 60_000;
+    if (remainingMs > 0) {
+      return clamp(Math.ceil(Math.floor(remainingMs / 1000) / 60), 1, MAX_INDEX);
+    }
+  }
+
+  return session.selectedIndex;
 }
 
 function render() {
@@ -745,7 +798,7 @@ function getDisplay(now: number): Display {
 
   const remainingSeconds = Math.floor(remainingMs / 1000);
   const hero =
-    remainingMs < 60_000 ? String(Math.max(0, remainingSeconds)) : String(session.selectedMinutes);
+    remainingMs < 60_000 ? String(Math.max(0, remainingSeconds)) : String(Math.ceil(remainingSeconds / 60));
   const label = formatDuration(remainingSeconds);
 
   return {

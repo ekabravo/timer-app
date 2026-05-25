@@ -1,0 +1,787 @@
+import "./styles.css";
+
+type Mode =
+  | "selecting"
+  | "timer_running"
+  | "timer_paused"
+  | "timer_overtime"
+  | "stopwatch_running"
+  | "stopwatch_paused";
+
+type Session = {
+  mode: Mode;
+  selectedIndex: number;
+  selectedMinutes: number;
+  targetAt: number | null;
+  pausedRemainingMs: number | null;
+  stopwatchStartedAt: number | null;
+  stopwatchElapsedMs: number;
+};
+
+type Snapshot = Session & {
+  version: 1;
+};
+
+type WakeLockSentinel = {
+  released: boolean;
+  release: () => Promise<void>;
+  addEventListener: (type: "release", listener: () => void) => void;
+};
+
+const STORAGE_KEY = "joyful-visual-timer/session";
+const MIN_INDEX = 0;
+const MAX_INDEX = 90;
+const FEED_RADIUS = 3;
+const RESET_WHEEL_THRESHOLD = 24;
+const RESET_TOUCH_THRESHOLD = 34;
+const STEP_WHEEL_THRESHOLD = 34;
+const STEP_TOUCH_THRESHOLD = 42;
+const FRAME_MS = 250;
+const appRoot = document.querySelector<HTMLElement>("#app");
+
+if (!appRoot) {
+  throw new Error("App root missing");
+}
+
+const app = appRoot;
+
+const defaultSession = (): Session => ({
+  mode: "selecting",
+  selectedIndex: 13,
+  selectedMinutes: 13,
+  targetAt: null,
+  pausedRemainingMs: null,
+  stopwatchStartedAt: null,
+  stopwatchElapsedMs: 0
+});
+
+let session = loadSession();
+let wakeLock: WakeLockSentinel | null = null;
+let wakeLockState: "off" | "pending" | "on" | "blocked" = "off";
+let wheelRemainder = 0;
+let touchStartY: number | null = null;
+let touchLastY: number | null = null;
+let touchRemainder = 0;
+let pointerStart: { x: number; y: number; t: number } | null = null;
+let lastSecondKey = "";
+let lastRenderKey = "";
+let tickPulseTimeout = 0;
+let rafId = 0;
+
+render();
+startRenderLoop();
+bindEvents();
+registerServiceWorker();
+syncWakeLock();
+
+function loadSession(): Session {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      return defaultSession();
+    }
+
+    const snapshot = JSON.parse(raw) as Partial<Snapshot>;
+    if (snapshot.version !== 1 || typeof snapshot.mode !== "string") {
+      return defaultSession();
+    }
+
+    const parsedIndex = Number(snapshot.selectedIndex);
+    const selectedIndex = Number.isFinite(parsedIndex)
+      ? clamp(parsedIndex, MIN_INDEX, MAX_INDEX)
+      : 13;
+    return {
+      mode: isMode(snapshot.mode) ? snapshot.mode : "selecting",
+      selectedIndex,
+      selectedMinutes: selectedIndexToMinutes(selectedIndex),
+      targetAt: typeof snapshot.targetAt === "number" ? snapshot.targetAt : null,
+      pausedRemainingMs:
+        typeof snapshot.pausedRemainingMs === "number" ? snapshot.pausedRemainingMs : null,
+      stopwatchStartedAt:
+        typeof snapshot.stopwatchStartedAt === "number" ? snapshot.stopwatchStartedAt : null,
+      stopwatchElapsedMs:
+        typeof snapshot.stopwatchElapsedMs === "number" ? snapshot.stopwatchElapsedMs : 0
+    };
+  } catch {
+    return defaultSession();
+  }
+}
+
+function isMode(value: string): value is Mode {
+  return [
+    "selecting",
+    "timer_running",
+    "timer_paused",
+    "timer_overtime",
+    "stopwatch_running",
+    "stopwatch_paused"
+  ].includes(value);
+}
+
+function persistSession() {
+  const snapshot: Snapshot = {
+    ...session,
+    version: 1
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+}
+
+function bindEvents() {
+  window.addEventListener(
+    "wheel",
+    (event) => {
+      if (session.mode === "selecting") {
+        event.preventDefault();
+        wheelRemainder += event.deltaY;
+        const steps = drainSteps(wheelRemainder, STEP_WHEEL_THRESHOLD);
+        if (steps !== 0) {
+          wheelRemainder -= steps * STEP_WHEEL_THRESHOLD;
+          moveSelection(-steps);
+        }
+        return;
+      }
+
+      if (isPaused() && Math.abs(event.deltaY) > RESET_WHEEL_THRESHOLD) {
+        event.preventDefault();
+        resetToSelecting();
+      }
+    },
+    { passive: false }
+  );
+
+  window.addEventListener(
+    "touchstart",
+    (event) => {
+      if (event.touches.length !== 1) {
+        return;
+      }
+
+      touchStartY = event.touches[0].clientY;
+      touchLastY = touchStartY;
+      touchRemainder = 0;
+    },
+    { passive: true }
+  );
+
+  window.addEventListener(
+    "touchmove",
+    (event) => {
+      if (touchLastY === null || event.touches.length !== 1) {
+        return;
+      }
+
+      const y = event.touches[0].clientY;
+      const delta = y - touchLastY;
+      touchLastY = y;
+
+      if (session.mode === "selecting") {
+        event.preventDefault();
+        touchRemainder += delta;
+        const steps = drainSteps(touchRemainder, STEP_TOUCH_THRESHOLD);
+        if (steps !== 0) {
+          touchRemainder -= steps * STEP_TOUCH_THRESHOLD;
+          moveSelection(steps);
+        }
+        return;
+      }
+
+      if (isPaused() && touchStartY !== null && Math.abs(y - touchStartY) > RESET_TOUCH_THRESHOLD) {
+        event.preventDefault();
+        resetToSelecting();
+      }
+    },
+    { passive: false }
+  );
+
+  window.addEventListener("touchend", () => {
+    touchStartY = null;
+    touchLastY = null;
+    touchRemainder = 0;
+  });
+
+  window.addEventListener("pointerdown", (event) => {
+    pointerStart = {
+      x: event.clientX,
+      y: event.clientY,
+      t: performance.now()
+    };
+  });
+
+  window.addEventListener("pointerup", (event) => {
+    if (!pointerStart) {
+      return;
+    }
+
+    const dx = event.clientX - pointerStart.x;
+    const dy = event.clientY - pointerStart.y;
+    const dt = performance.now() - pointerStart.t;
+    pointerStart = null;
+
+    if (Math.hypot(dx, dy) > 14 || dt > 700) {
+      return;
+    }
+
+    activate();
+  });
+
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      if (session.mode === "selecting") {
+        moveSelection(1);
+      } else if (isPaused()) {
+        resetToSelecting();
+      }
+      return;
+    }
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      if (session.mode === "selecting") {
+        moveSelection(-1);
+      } else if (isPaused()) {
+        resetToSelecting();
+      }
+      return;
+    }
+
+    if (event.key === " " || event.key === "Enter") {
+      event.preventDefault();
+      activate();
+    }
+  });
+
+  window.addEventListener("visibilitychange", () => {
+    render();
+    syncWakeLock();
+  });
+  window.addEventListener("pageshow", () => {
+    render();
+    syncWakeLock();
+  });
+  window.addEventListener("pagehide", () => {
+    persistSession();
+  });
+}
+
+function drainSteps(value: number, threshold: number) {
+  if (Math.abs(value) < threshold) {
+    return 0;
+  }
+
+  return value > 0 ? Math.floor(value / threshold) : Math.ceil(value / threshold);
+}
+
+function moveSelection(direction: number) {
+  const next = clamp(session.selectedIndex + direction, MIN_INDEX, MAX_INDEX);
+  if (next === session.selectedIndex) {
+    nudgeEdge(direction);
+    return;
+  }
+
+  session = {
+    ...session,
+    mode: "selecting",
+    selectedIndex: next,
+    selectedMinutes: selectedIndexToMinutes(next),
+    targetAt: null,
+    pausedRemainingMs: null,
+    stopwatchStartedAt: null,
+    stopwatchElapsedMs: 0
+  };
+  app.dataset.bump = direction > 0 ? "up" : "down";
+  pulseSelection();
+  persistSession();
+  render();
+}
+
+function nudgeEdge(direction: number) {
+  app.dataset.bump = direction > 0 ? "edge-up" : "edge-down";
+  window.setTimeout(() => {
+    if (app.dataset.bump?.startsWith("edge")) {
+      delete app.dataset.bump;
+    }
+  }, 220);
+}
+
+function pulseSelection() {
+  app.classList.remove("selection-pulse");
+  void app.offsetWidth;
+  app.classList.add("selection-pulse");
+  vibrate(6);
+}
+
+function activate() {
+  const now = Date.now();
+
+  if (session.mode === "selecting") {
+    app.classList.add("launching");
+    window.setTimeout(() => app.classList.remove("launching"), 620);
+
+    if (session.selectedIndex === 0) {
+      session = {
+        ...session,
+        mode: "stopwatch_running",
+        selectedMinutes: 0,
+        stopwatchStartedAt: now,
+        stopwatchElapsedMs: 0,
+        targetAt: null,
+        pausedRemainingMs: null
+      };
+    } else {
+      session = {
+        ...session,
+        mode: "timer_running",
+        selectedMinutes: session.selectedIndex,
+        targetAt: now + session.selectedIndex * 60_000,
+        pausedRemainingMs: null,
+        stopwatchStartedAt: null,
+        stopwatchElapsedMs: 0
+      };
+    }
+
+    vibrate(18);
+    persistSession();
+    render();
+    syncWakeLock();
+    return;
+  }
+
+  if (session.mode === "timer_running" || session.mode === "timer_overtime") {
+    const remainingMs = getTimerRemainingMs(now);
+    session = {
+      ...session,
+      mode: "timer_paused",
+      pausedRemainingMs: remainingMs,
+      targetAt: null
+    };
+    vibrate(10);
+    persistSession();
+    render();
+    syncWakeLock();
+    return;
+  }
+
+  if (session.mode === "timer_paused") {
+    const pausedRemainingMs = session.pausedRemainingMs ?? session.selectedMinutes * 60_000;
+    session = {
+      ...session,
+      mode: pausedRemainingMs > 0 ? "timer_running" : "timer_overtime",
+      targetAt: now + pausedRemainingMs,
+      pausedRemainingMs: null
+    };
+    vibrate(12);
+    persistSession();
+    render();
+    syncWakeLock();
+    return;
+  }
+
+  if (session.mode === "stopwatch_running") {
+    session = {
+      ...session,
+      mode: "stopwatch_paused",
+      stopwatchElapsedMs: getStopwatchElapsedMs(now),
+      stopwatchStartedAt: null
+    };
+    vibrate(10);
+    persistSession();
+    render();
+    syncWakeLock();
+    return;
+  }
+
+  if (session.mode === "stopwatch_paused") {
+    session = {
+      ...session,
+      mode: "stopwatch_running",
+      stopwatchStartedAt: now,
+      stopwatchElapsedMs: session.stopwatchElapsedMs
+    };
+    vibrate(12);
+    persistSession();
+    render();
+    syncWakeLock();
+  }
+}
+
+function resetToSelecting() {
+  session = {
+    ...defaultSession(),
+    selectedIndex: session.selectedIndex,
+    selectedMinutes: selectedIndexToMinutes(session.selectedIndex)
+  };
+  app.classList.add("resetting");
+  window.setTimeout(() => app.classList.remove("resetting"), 320);
+  vibrate([8, 22, 8]);
+  persistSession();
+  render();
+  syncWakeLock();
+}
+
+function render() {
+  const now = Date.now();
+  const display = getDisplay(now);
+  const secondKey = `${display.mode}:${display.label}:${display.hero}`;
+  const tickChanged = lastSecondKey && lastSecondKey !== secondKey;
+  const shouldPulse =
+    tickChanged && display.focused && !display.paused && isRunningMode(display.mode);
+
+  if (shouldPulse) {
+    triggerTickPulse();
+  } else if (display.paused) {
+    stopTickPulse();
+  }
+  lastSecondKey = secondKey;
+
+  app.dataset.mode = display.mode;
+  app.dataset.visual = display.visual;
+  app.dataset.focused = String(display.focused);
+  app.dataset.paused = String(display.paused);
+  app.dataset.overtime = String(display.overtime);
+  app.dataset.wake = wakeLockState;
+
+  const renderKey = [
+    display.mode,
+    display.visual,
+    display.focused,
+    display.paused,
+    display.overtime,
+    display.hero,
+    display.label,
+    display.announcement
+  ].join("|");
+
+  if (renderKey !== lastRenderKey) {
+    app.innerHTML = display.focused ? renderFocused(display) : renderFeed(display);
+    lastRenderKey = renderKey;
+  }
+}
+
+function triggerTickPulse() {
+  app.classList.remove("tick-pulse");
+  void app.offsetWidth;
+  app.classList.add("tick-pulse");
+  window.clearTimeout(tickPulseTimeout);
+  tickPulseTimeout = window.setTimeout(() => {
+    app.classList.remove("tick-pulse");
+  }, 260);
+}
+
+function stopTickPulse() {
+  window.clearTimeout(tickPulseTimeout);
+  app.classList.remove("tick-pulse");
+}
+
+function renderFeed(display: Display) {
+  const items = [];
+  const from = clamp(session.selectedIndex - FEED_RADIUS, MIN_INDEX, MAX_INDEX);
+  const to = clamp(session.selectedIndex + FEED_RADIUS, MIN_INDEX, MAX_INDEX);
+
+  for (let index = to; index >= from; index -= 1) {
+    const distance = index - session.selectedIndex;
+    const abs = Math.abs(distance);
+    const y = getFeedOffset(distance);
+    const scale = abs === 0 ? 1 : Math.max(0.24, 0.5 - (abs - 1) * 0.08);
+    const opacity = abs === 0 ? 1 : Math.max(0.14, 0.64 - abs * 0.1);
+    const blur = abs > 2 ? 1.2 : abs === 0 ? 0 : 0.25;
+    const rotate = distance * -1.8;
+    const value = index === 0 ? "+" : String(index);
+    const current = index === session.selectedIndex ? "true" : "false";
+    const className = index === 0 ? "feed-value plus" : "feed-value";
+
+    items.push(`
+      <div
+        class="${className}"
+        aria-current="${current}"
+        style="
+          --distance:${distance};
+          --abs:${abs};
+          --feed-y:${y};
+          --feed-scale:${scale};
+          --feed-rotate:${rotate}deg;
+          transform: translate3d(-50%, calc(-50% + var(--feed-y)), 0) scale(var(--feed-scale)) rotateX(var(--feed-rotate));
+          opacity:${opacity};
+          filter: blur(${blur}px);
+          z-index:${100 - abs};
+        "
+      >${value}</div>
+    `);
+  }
+
+  return `
+    <section class="stage" aria-label="Timer value selector">
+      <div class="wake-dot" aria-hidden="true"></div>
+      <div class="feed" role="listbox" aria-label="Timer values">${items.join("")}</div>
+      <p class="sr-only">${display.announcement}</p>
+    </section>
+  `;
+}
+
+function getFeedOffset(distance: number) {
+  const abs = Math.abs(distance);
+  if (abs === 0) {
+    return "0px";
+  }
+
+  const offset = `clamp(${abs * 13}rem, ${abs * 34}dvh, ${abs * 22}rem)`;
+  return distance > 0 ? `calc(0px - ${offset})` : offset;
+}
+
+function renderFocused(display: Display) {
+  return `
+    <section class="stage focus-stage" aria-label="${display.announcement}">
+      <div class="wake-dot" aria-hidden="true"></div>
+      <div class="focus-shell">
+        <div class="focus-number" aria-hidden="true">${display.hero}</div>
+        <div class="sub-time" aria-hidden="true">${display.label}</div>
+        <div class="pause-mark" aria-hidden="true"><span></span><span></span></div>
+      </div>
+      <p class="sr-only">${display.announcement}</p>
+    </section>
+  `;
+}
+
+type Display = {
+  mode: Mode;
+  visual: "timer" | "stopwatch";
+  focused: boolean;
+  paused: boolean;
+  overtime: boolean;
+  hero: string;
+  label: string;
+  announcement: string;
+};
+
+function getDisplay(now: number): Display {
+  if (session.mode === "selecting") {
+    const value = session.selectedIndex === 0 ? "stopwatch" : `${session.selectedIndex} minutes`;
+    return {
+      mode: "selecting",
+      visual: session.selectedIndex === 0 ? "stopwatch" : "timer",
+      focused: false,
+      paused: false,
+      overtime: false,
+      hero: session.selectedIndex === 0 ? "+" : String(session.selectedIndex),
+      label: "",
+      announcement: `Selected ${value}`
+    };
+  }
+
+  if (session.mode === "stopwatch_running" || session.mode === "stopwatch_paused") {
+    const elapsedMs =
+      session.mode === "stopwatch_paused"
+        ? session.stopwatchElapsedMs
+        : getStopwatchElapsedMs(now);
+    const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+    const hero = totalSeconds < 60 ? String(totalSeconds) : String(Math.floor(totalSeconds / 60));
+    const label = formatDuration(totalSeconds);
+
+    return {
+      mode: session.mode,
+      visual: "stopwatch",
+      focused: true,
+      paused: session.mode === "stopwatch_paused",
+      overtime: false,
+      hero,
+      label,
+      announcement: `${label} stopwatch ${session.mode === "stopwatch_paused" ? "paused" : "running"}`
+    };
+  }
+
+  const remainingMs =
+    session.mode === "timer_paused"
+      ? session.pausedRemainingMs ?? session.selectedMinutes * 60_000
+      : getTimerRemainingMs(now);
+
+  if (session.mode === "timer_running" && remainingMs <= 0) {
+    session = {
+      ...session,
+      mode: "timer_overtime"
+    };
+    persistSession();
+  }
+
+  const overtime = remainingMs <= 0 || session.mode === "timer_overtime";
+  const totalSeconds = Math.max(0, Math.floor(Math.abs(remainingMs) / 1000));
+
+  if (overtime) {
+    const label = `+${formatDuration(totalSeconds)}`;
+    return {
+      mode: session.mode === "timer_paused" ? "timer_paused" : "timer_overtime",
+      visual: "timer",
+      focused: true,
+      paused: session.mode === "timer_paused",
+      overtime: true,
+      hero: "0",
+      label,
+      announcement: `${label} overtime ${session.mode === "timer_paused" ? "paused" : "running"}`
+    };
+  }
+
+  const remainingSeconds = Math.floor(remainingMs / 1000);
+  const hero =
+    remainingMs < 60_000 ? String(Math.max(0, remainingSeconds)) : String(session.selectedMinutes);
+  const label = formatDuration(remainingSeconds);
+
+  return {
+    mode: session.mode,
+    visual: "timer",
+    focused: true,
+    paused: session.mode === "timer_paused",
+    overtime: false,
+    hero,
+    label,
+    announcement: `${label} remaining ${session.mode === "timer_paused" ? "paused" : "running"}`
+  };
+}
+
+function getTimerRemainingMs(now: number) {
+  if (typeof session.targetAt !== "number") {
+    return session.pausedRemainingMs ?? session.selectedMinutes * 60_000;
+  }
+
+  return session.targetAt - now;
+}
+
+function getStopwatchElapsedMs(now: number) {
+  return session.stopwatchElapsedMs + Math.max(0, now - (session.stopwatchStartedAt ?? now));
+}
+
+function selectedIndexToMinutes(index: number) {
+  return index === 0 ? 0 : index;
+}
+
+function formatDuration(totalSeconds: number) {
+  const seconds = Math.max(0, totalSeconds);
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function isPaused() {
+  return session.mode === "timer_paused" || session.mode === "stopwatch_paused";
+}
+
+function isRunningMode(mode: Mode) {
+  return mode === "timer_running" || mode === "timer_overtime" || mode === "stopwatch_running";
+}
+
+function vibrate(pattern: number | number[]) {
+  if ("vibrate" in navigator) {
+    navigator.vibrate(pattern);
+  }
+}
+
+function startRenderLoop() {
+  let lastFrame = 0;
+  const frame = (time: number) => {
+    if (time - lastFrame >= FRAME_MS) {
+      lastFrame = time;
+      if (session.mode !== "selecting") {
+        render();
+      }
+    }
+
+    rafId = window.requestAnimationFrame(frame);
+  };
+
+  if (rafId) {
+    window.cancelAnimationFrame(rafId);
+  }
+  rafId = window.requestAnimationFrame(frame);
+}
+
+async function syncWakeLock() {
+  const shouldHold =
+    document.visibilityState === "visible" &&
+    (session.mode === "timer_running" ||
+      session.mode === "timer_overtime" ||
+      session.mode === "stopwatch_running");
+
+  if (!shouldHold) {
+    if (wakeLock && !wakeLock.released) {
+      await wakeLock.release().catch(() => undefined);
+    }
+    wakeLock = null;
+    wakeLockState = "off";
+    render();
+    return;
+  }
+
+  if (!("wakeLock" in navigator) || wakeLockState === "pending" || wakeLock) {
+    return;
+  }
+
+  try {
+    wakeLockState = "pending";
+    render();
+    const manager = navigator.wakeLock as { request: (type: "screen") => Promise<WakeLockSentinel> };
+    wakeLock = await manager.request("screen");
+    wakeLockState = "on";
+    wakeLock.addEventListener("release", () => {
+      wakeLock = null;
+      wakeLockState = "off";
+      render();
+    });
+  } catch {
+    wakeLock = null;
+    wakeLockState = "blocked";
+  }
+
+  render();
+}
+
+function registerServiceWorker() {
+  if (!("serviceWorker" in navigator) || import.meta.env.DEV) {
+    return;
+  }
+
+  window.addEventListener("load", () => {
+    navigator.serviceWorker
+      .register("/sw.js")
+      .then(() => navigator.serviceWorker.ready)
+      .then((registration) => {
+        warmServiceWorkerCache(registration);
+      })
+      .catch(() => undefined);
+  });
+}
+
+function warmServiceWorkerCache(registration: ServiceWorkerRegistration) {
+  const worker = registration.active ?? registration.waiting ?? registration.installing;
+  if (!worker) {
+    return;
+  }
+
+  worker.postMessage({
+    type: "WARM_CACHE",
+    urls: getCacheWarmUrls()
+  });
+}
+
+function getCacheWarmUrls() {
+  const urls = new Set(["/", "/index.html", "/manifest.webmanifest", "/icon.svg"]);
+
+  const addUrl = (value: string) => {
+    try {
+      const url = new URL(value, window.location.href);
+      if (url.origin !== window.location.origin || url.pathname === "/sw.js") {
+        return;
+      }
+      urls.add(`${url.pathname}${url.search}`);
+    } catch {
+      return;
+    }
+  };
+
+  document.querySelectorAll<HTMLLinkElement>("link[href]").forEach((link) => addUrl(link.href));
+  document.querySelectorAll<HTMLScriptElement>("script[src]").forEach((script) => addUrl(script.src));
+  performance.getEntriesByType("resource").forEach((entry) => addUrl(entry.name));
+
+  return [...urls];
+}

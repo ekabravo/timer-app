@@ -1,12 +1,33 @@
-const CACHE_NAME = "visual-timer-v4";
-const SHELL = ["/manifest.webmanifest", "/icon.svg"];
+const CACHE_NAME = "visual-timer-dev";
+const PRECACHE_URLS = ["/", "/index.html", "/manifest.webmanifest", "/icon.svg"];
+const DISABLE_CACHE = isDevelopmentHost(self.location.hostname);
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(precacheAppShell());
+  if (DISABLE_CACHE) {
+    self.skipWaiting();
+    return;
+  }
+
+  event.waitUntil(precacheApp());
   self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
+  if (DISABLE_CACHE) {
+    event.waitUntil(
+      caches
+        .keys()
+        .then((keys) =>
+          Promise.all(
+            keys.filter((key) => key.startsWith("visual-timer-")).map((key) => caches.delete(key))
+          )
+        )
+        .then(() => self.registration.unregister())
+    );
+    self.clients.claim();
+    return;
+  }
+
   event.waitUntil(
     caches
       .keys()
@@ -18,6 +39,10 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("message", (event) => {
+  if (DISABLE_CACHE) {
+    return;
+  }
+
   if (event.data?.type !== "WARM_CACHE" || !Array.isArray(event.data.urls)) {
     return;
   }
@@ -37,6 +62,10 @@ self.addEventListener("message", (event) => {
 });
 
 self.addEventListener("fetch", (event) => {
+  if (DISABLE_CACHE) {
+    return;
+  }
+
   if (event.request.method !== "GET") {
     return;
   }
@@ -57,7 +86,7 @@ self.addEventListener("fetch", (event) => {
 function cacheFirst(event, fallbackUrl) {
   const { request } = event;
 
-  return caches.match(request).then((cached) => {
+  return caches.match(request, { ignoreVary: true }).then((cached) => {
     const refresh = fetchAndCache(request);
 
     if (cached) {
@@ -66,12 +95,14 @@ function cacheFirst(event, fallbackUrl) {
     }
 
     return refresh
-      .then((response) => response || (fallbackUrl ? caches.match(fallbackUrl) : undefined))
+      .then((response) =>
+        response || (fallbackUrl ? caches.match(fallbackUrl, { ignoreVary: true }) : undefined)
+      )
       .then((response) => response || Response.error());
   });
 }
 
-function fetchAndCache(request) {
+async function fetchAndCache(request) {
   return fetch(request)
     .then(async (response) => {
       if (response.ok && response.type === "basic") {
@@ -85,41 +116,11 @@ function fetchAndCache(request) {
     .catch(() => undefined);
 }
 
-async function precacheAppShell() {
+async function precacheApp() {
   const cache = await caches.open(CACHE_NAME);
-  const indexResponse = await fetch(new Request("/index.html", { cache: "reload" }));
-  const indexHtml = await indexResponse.text();
-  const indexInit = {
-    status: indexResponse.status,
-    statusText: indexResponse.statusText
-  };
-
-  await Promise.all([
-    cache.put("/", new Response(indexHtml, { ...indexInit, headers: new Headers(indexResponse.headers) })),
-    cache.put(
-      "/index.html",
-      new Response(indexHtml, { ...indexInit, headers: new Headers(indexResponse.headers) })
-    ),
-    cache.addAll(SHELL.map((url) => new Request(url, { cache: "reload" })))
-  ]);
-
-  const assetUrls = getSameOriginAssetUrls(indexHtml);
-  await cache.addAll(assetUrls.map((url) => new Request(url, { cache: "reload" })));
-}
-
-function getSameOriginAssetUrls(html) {
-  const urls = new Set();
-  const pattern = /\b(?:href|src)="([^"]+)"/g;
-  let match;
-
-  while ((match = pattern.exec(html))) {
-    const url = normalizeSameOriginUrl(match[1]);
-    if (url) {
-      urls.add(url);
-    }
-  }
-
-  return [...urls];
+  await cache.addAll(
+    PRECACHE_URLS.map((url) => new Request(url, { cache: "reload" }))
+  );
 }
 
 function normalizeSameOriginUrl(value) {
@@ -133,4 +134,17 @@ function normalizeSameOriginUrl(value) {
   } catch {
     return null;
   }
+}
+
+function isDevelopmentHost(hostname) {
+  return (
+    hostname === "localhost" ||
+    hostname === "0.0.0.0" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname.startsWith("127.") ||
+    hostname.startsWith("10.") ||
+    hostname.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname)
+  );
 }

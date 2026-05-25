@@ -28,6 +28,19 @@ type WakeLockSentinel = {
   addEventListener: (type: "release", listener: () => void) => void;
 };
 
+type PointerGesture = {
+  id: number;
+  pointerType: string;
+  startX: number;
+  startY: number;
+  startIndex: number;
+  startedAt: number;
+  lastY: number;
+  lastAt: number;
+  speed: number;
+  stepRemainder: number;
+};
+
 const STORAGE_KEY = "joyful-visual-timer/session";
 const MIN_INDEX = 0;
 const MAX_INDEX = 90;
@@ -35,7 +48,18 @@ const FEED_RADIUS = 3;
 const RESET_WHEEL_THRESHOLD = 24;
 const RESET_TOUCH_THRESHOLD = 34;
 const STEP_WHEEL_THRESHOLD = 34;
-const STEP_TOUCH_THRESHOLD = 42;
+const TOUCH_SLOW_HALF_SCREEN_STEPS = 4;
+const TOUCH_FAST_HALF_SCREEN_STEPS = 29;
+const TOUCH_MIN_SLOW_THRESHOLD = 72;
+const TOUCH_MAX_SLOW_THRESHOLD = 120;
+const TOUCH_MIN_FAST_THRESHOLD = 10;
+const TOUCH_MAX_FAST_THRESHOLD = 18;
+const TOUCH_SLOW_SPEED = 0.035;
+const TOUCH_FAST_SPEED = 0.42;
+const TOUCH_SLOW_STEP_MS = 96;
+const TOUCH_FAST_STEP_MS = 16;
+const TOUCH_SLOW_TRANSITION_MS = 360;
+const TOUCH_FAST_TRANSITION_MS = 90;
 const FRAME_MS = 250;
 const appRoot = document.querySelector<HTMLElement>("#app");
 
@@ -59,10 +83,10 @@ let session = loadSession();
 let wakeLock: WakeLockSentinel | null = null;
 let wakeLockState: "off" | "pending" | "on" | "blocked" = "off";
 let wheelRemainder = 0;
-let touchStartY: number | null = null;
-let touchLastY: number | null = null;
-let touchRemainder = 0;
-let pointerStart: { x: number; y: number; t: number } | null = null;
+let pointerGesture: PointerGesture | null = null;
+let touchTargetIndex: number | null = null;
+let touchStepDelay = TOUCH_SLOW_STEP_MS;
+let touchStepTimeout = 0;
 let lastSecondKey = "";
 let lastRenderKey = "";
 let tickPulseTimeout = 0;
@@ -149,43 +173,46 @@ function bindEvents() {
     { passive: false }
   );
 
+  window.addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary) {
+      return;
+    }
+
+    const now = event.timeStamp || performance.now();
+    pointerGesture = {
+      id: event.pointerId,
+      pointerType: event.pointerType,
+      startX: event.clientX,
+      startY: event.clientY,
+      startIndex: session.selectedIndex,
+      startedAt: now,
+      lastY: event.clientY,
+      lastAt: now,
+      speed: 0,
+      stepRemainder: 0
+    };
+    touchTargetIndex = null;
+    window.clearTimeout(touchStepTimeout);
+  });
+
   window.addEventListener(
-    "touchstart",
+    "pointermove",
     (event) => {
-      if (event.touches.length !== 1) {
+      if (!pointerGesture || event.pointerId !== pointerGesture.id) {
         return;
       }
 
-      touchStartY = event.touches[0].clientY;
-      touchLastY = touchStartY;
-      touchRemainder = 0;
-    },
-    { passive: true }
-  );
-
-  window.addEventListener(
-    "touchmove",
-    (event) => {
-      if (touchLastY === null || event.touches.length !== 1) {
+      if (pointerGesture.pointerType !== "touch") {
         return;
       }
-
-      const y = event.touches[0].clientY;
-      const delta = y - touchLastY;
-      touchLastY = y;
 
       if (session.mode === "selecting") {
         event.preventDefault();
-        touchRemainder += delta;
-        const steps = drainSteps(touchRemainder, STEP_TOUCH_THRESHOLD);
-        if (steps !== 0) {
-          touchRemainder -= steps * STEP_TOUCH_THRESHOLD;
-          moveSelection(steps);
-        }
+        processTouchSelectionMove(event);
         return;
       }
 
-      if (isPaused() && touchStartY !== null && Math.abs(y - touchStartY) > RESET_TOUCH_THRESHOLD) {
+      if (isPaused() && Math.abs(event.clientY - pointerGesture.startY) > RESET_TOUCH_THRESHOLD) {
         event.preventDefault();
         resetToSelecting();
       }
@@ -193,35 +220,34 @@ function bindEvents() {
     { passive: false }
   );
 
-  window.addEventListener("touchend", () => {
-    touchStartY = null;
-    touchLastY = null;
-    touchRemainder = 0;
-  });
-
-  window.addEventListener("pointerdown", (event) => {
-    pointerStart = {
-      x: event.clientX,
-      y: event.clientY,
-      t: performance.now()
-    };
-  });
-
   window.addEventListener("pointerup", (event) => {
-    if (!pointerStart) {
+    if (!pointerGesture || event.pointerId !== pointerGesture.id) {
       return;
     }
 
-    const dx = event.clientX - pointerStart.x;
-    const dy = event.clientY - pointerStart.y;
-    const dt = performance.now() - pointerStart.t;
-    pointerStart = null;
+    const dx = event.clientX - pointerGesture.startX;
+    const dy = event.clientY - pointerGesture.startY;
+    const dt = performance.now() - pointerGesture.startedAt;
+    const wasTouchSelection =
+      pointerGesture.pointerType === "touch" &&
+      session.mode === "selecting" &&
+      Math.hypot(dx, dy) > 14;
+    pointerGesture = null;
+
+    if (!wasTouchSelection || touchTargetIndex === session.selectedIndex) {
+      clearTouchSelectionCue();
+    }
 
     if (Math.hypot(dx, dy) > 14 || dt > 700) {
       return;
     }
 
     activate();
+  });
+
+  window.addEventListener("pointercancel", () => {
+    pointerGesture = null;
+    clearTouchSelectionState();
   });
 
   window.addEventListener("keydown", (event) => {
@@ -270,6 +296,106 @@ function drainSteps(value: number, threshold: number) {
   }
 
   return value > 0 ? Math.floor(value / threshold) : Math.ceil(value / threshold);
+}
+
+function getTouchSpeedRatio(speed: number) {
+  const ratio = clamp((speed - TOUCH_SLOW_SPEED) / (TOUCH_FAST_SPEED - TOUCH_SLOW_SPEED), 0, 1);
+  return ratio ** 1.35;
+}
+
+function getTouchStepThreshold(speed: number) {
+  const halfScreen = Math.max(240, window.innerHeight * 0.5);
+  const slowThreshold = clamp(
+    halfScreen / TOUCH_SLOW_HALF_SCREEN_STEPS,
+    TOUCH_MIN_SLOW_THRESHOLD,
+    TOUCH_MAX_SLOW_THRESHOLD
+  );
+  const fastThreshold = clamp(
+    halfScreen / TOUCH_FAST_HALF_SCREEN_STEPS,
+    TOUCH_MIN_FAST_THRESHOLD,
+    TOUCH_MAX_FAST_THRESHOLD
+  );
+
+  const eased = getTouchSpeedRatio(speed);
+  return slowThreshold + (fastThreshold - slowThreshold) * eased;
+}
+
+function getTouchStepDelay(speed: number) {
+  const ratio = clamp((speed - TOUCH_SLOW_SPEED) / (TOUCH_FAST_SPEED - TOUCH_SLOW_SPEED), 0, 1);
+  const eased = ratio ** 0.8;
+  return TOUCH_SLOW_STEP_MS + (TOUCH_FAST_STEP_MS - TOUCH_SLOW_STEP_MS) * eased;
+}
+
+function updateTouchSelectionCue(speed: number) {
+  const ratio = getTouchSpeedRatio(speed);
+  const transitionMs =
+    TOUCH_SLOW_TRANSITION_MS + (TOUCH_FAST_TRANSITION_MS - TOUCH_SLOW_TRANSITION_MS) * ratio;
+
+  app.dataset.scrubbing = "true";
+  app.style.setProperty("--selection-transition-ms", `${Math.round(transitionMs)}ms`);
+}
+
+function clearTouchSelectionCue() {
+  delete app.dataset.scrubbing;
+  app.style.removeProperty("--selection-transition-ms");
+}
+
+function clearTouchSelectionState() {
+  touchTargetIndex = null;
+  window.clearTimeout(touchStepTimeout);
+  clearTouchSelectionCue();
+}
+
+function processTouchSelectionMove(event: PointerEvent) {
+  if (!pointerGesture) {
+    return;
+  }
+
+  const samples = event.getCoalescedEvents?.() ?? [];
+  const moves = samples.length > 0 ? samples : [event];
+  const move = moves[moves.length - 1];
+  const y = move.clientY;
+  const at = move.timeStamp || performance.now();
+  const moveElapsed = Math.max(1, at - pointerGesture.lastAt);
+  const fingerDelta = y - pointerGesture.lastY;
+  const moveSpeed = Math.abs(fingerDelta) / moveElapsed;
+  const speed = Math.max(moveSpeed, pointerGesture.speed * 0.45);
+  const threshold = getTouchStepThreshold(speed);
+  pointerGesture.stepRemainder += fingerDelta / threshold;
+  const steps = pointerGesture.stepRemainder > 0
+    ? Math.floor(pointerGesture.stepRemainder)
+    : Math.ceil(pointerGesture.stepRemainder);
+
+  pointerGesture.lastY = y;
+  pointerGesture.lastAt = at;
+  pointerGesture.speed = speed;
+  touchStepDelay = getTouchStepDelay(speed);
+  updateTouchSelectionCue(speed);
+
+  if (steps !== 0) {
+    pointerGesture.stepRemainder -= steps;
+    touchTargetIndex = clamp(
+      (touchTargetIndex ?? session.selectedIndex) + steps,
+      MIN_INDEX,
+      MAX_INDEX
+    );
+    stepTowardTouchTarget();
+  }
+}
+
+function stepTowardTouchTarget() {
+  window.clearTimeout(touchStepTimeout);
+  if (touchTargetIndex === null || touchTargetIndex === session.selectedIndex) {
+    return;
+  }
+
+  moveSelection(touchTargetIndex > session.selectedIndex ? 1 : -1);
+
+  if (touchTargetIndex !== session.selectedIndex) {
+    touchStepTimeout = window.setTimeout(stepTowardTouchTarget, touchStepDelay);
+  } else if (!pointerGesture) {
+    window.setTimeout(clearTouchSelectionCue, 80);
+  }
 }
 
 function moveSelection(direction: number) {
@@ -511,7 +637,6 @@ function renderFeed(display: Display) {
 
   return `
     <section class="stage" aria-label="Timer value selector">
-      <div class="wake-dot" aria-hidden="true"></div>
       <div class="feed" role="listbox" aria-label="Timer values">${items.join("")}</div>
       <p class="sr-only">${display.announcement}</p>
     </section>
@@ -531,7 +656,6 @@ function getFeedOffset(distance: number) {
 function renderFocused(display: Display) {
   return `
     <section class="stage focus-stage" aria-label="${display.announcement}">
-      <div class="wake-dot" aria-hidden="true"></div>
       <div class="focus-shell">
         <div class="focus-number" aria-hidden="true">${display.hero}</div>
         <div class="sub-time" aria-hidden="true">${display.label}</div>
@@ -737,7 +861,12 @@ async function syncWakeLock() {
 }
 
 function registerServiceWorker() {
-  if (!("serviceWorker" in navigator) || import.meta.env.DEV) {
+  if (import.meta.env.DEV) {
+    disableDevelopmentCaching();
+    return;
+  }
+
+  if (!("serviceWorker" in navigator)) {
     return;
   }
 
@@ -750,6 +879,30 @@ function registerServiceWorker() {
       })
       .catch(() => undefined);
   });
+}
+
+function disableDevelopmentCaching() {
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker
+      .getRegistrations()
+      .then((registrations) =>
+        Promise.all(registrations.map((registration) => registration.unregister()))
+      )
+      .catch(() => undefined);
+  }
+
+  if ("caches" in window) {
+    caches
+      .keys()
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((key) => key.startsWith("visual-timer-"))
+            .map((key) => caches.delete(key))
+        )
+      )
+      .catch(() => undefined);
+  }
 }
 
 function warmServiceWorkerCache(registration: ServiceWorkerRegistration) {

@@ -361,14 +361,20 @@ function updateTouchSelectionCue(speed: number) {
   const ratio = getTouchSpeedRatio(speed);
   const transitionMs =
     TOUCH_SLOW_TRANSITION_MS + (TOUCH_FAST_TRANSITION_MS - TOUCH_SLOW_TRANSITION_MS) * ratio;
+  const feedFlowDistance = 86 + 86 * ratio;
+  const feedOvershoot = 10 + 18 * ratio;
 
   app.dataset.scrubbing = "true";
   app.style.setProperty("--selection-transition-ms", `${Math.round(transitionMs)}ms`);
+  app.style.setProperty("--feed-flow-distance", `${Math.round(feedFlowDistance)}px`);
+  app.style.setProperty("--feed-flow-overshoot", `${Math.round(feedOvershoot)}px`);
 }
 
 function clearTouchSelectionCue() {
   delete app.dataset.scrubbing;
   app.style.removeProperty("--selection-transition-ms");
+  app.style.removeProperty("--feed-flow-distance");
+  app.style.removeProperty("--feed-flow-overshoot");
 }
 
 function clearTouchSelectionState() {

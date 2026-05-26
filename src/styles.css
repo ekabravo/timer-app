@@ -93,8 +93,11 @@ select {
   position: absolute;
   inset: 0;
   --feed-active-size: clamp(10rem, min(42dvh, 56vw), 28rem);
+  --feed-flow-distance: clamp(5.5rem, 13dvh, 9.5rem);
+  --feed-flow-overshoot: clamp(0.7rem, 2.1dvh, 1.55rem);
   perspective: 900px;
   transform-style: preserve-3d;
+  will-change: transform;
 }
 
 .feed-value {
@@ -289,7 +292,27 @@ select {
 }
 
 .selection-pulse .feed-value[aria-current="true"] {
-  animation: selectPulse 360ms cubic-bezier(0.22, 1.28, 0.34, 1);
+  animation: selectPulse 430ms cubic-bezier(0.18, 1.58, 0.28, 1);
+}
+
+.selection-pulse[data-bump="up"] .feed,
+.selection-pulse[data-bump="down"] .feed {
+  animation-duration: var(--selection-transition-ms, 430ms);
+  animation-timing-function: cubic-bezier(0.16, 1.22, 0.2, 1);
+  animation-fill-mode: both;
+}
+
+.selection-pulse[data-bump="up"] .feed {
+  animation-name: feedFlowUp;
+}
+
+.selection-pulse[data-bump="down"] .feed {
+  animation-name: feedFlowDown;
+}
+
+[data-scrubbing="true"].selection-pulse[data-bump="up"] .feed,
+[data-scrubbing="true"].selection-pulse[data-bump="down"] .feed {
+  animation-timing-function: cubic-bezier(0.08, 0.86, 0.18, 1);
 }
 
 .launching .feed-value[aria-current="true"] {
@@ -335,13 +358,46 @@ select {
 
 @keyframes selectPulse {
   0% {
-    transform: translate3d(-50%, calc(-50% + var(--feed-y)), 0) scale(0.98);
+    transform: translate3d(-50%, calc(-50% + var(--feed-y)), 0) scale(0.94, 1.08);
   }
-  64% {
-    transform: translate3d(-50%, calc(-50% + var(--feed-y)), 0) scale(1.025, 0.985);
+  42% {
+    transform: translate3d(-50%, calc(-50% + var(--feed-y)), 0) scale(1.055, 0.955);
+  }
+  72% {
+    transform: translate3d(-50%, calc(-50% + var(--feed-y)), 0) scale(0.985, 1.018);
   }
   100% {
     transform: translate3d(-50%, calc(-50% + var(--feed-y)), 0) scale(1);
+  }
+}
+
+@keyframes feedFlowUp {
+  0% {
+    transform: translate3d(0, calc(var(--feed-flow-distance) * -1), 0);
+  }
+  62% {
+    transform: translate3d(0, var(--feed-flow-overshoot), 0);
+  }
+  82% {
+    transform: translate3d(0, calc(var(--feed-flow-overshoot) * -0.32), 0);
+  }
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes feedFlowDown {
+  0% {
+    transform: translate3d(0, var(--feed-flow-distance), 0);
+  }
+  62% {
+    transform: translate3d(0, calc(var(--feed-flow-overshoot) * -1), 0);
+  }
+  82% {
+    transform: translate3d(0, calc(var(--feed-flow-overshoot) * 0.32), 0);
+  }
+  100% {
+    transform: translate3d(0, 0, 0);
   }
 }
 

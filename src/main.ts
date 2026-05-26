@@ -11,6 +11,7 @@ type Session = {
   mode: Mode;
   selectedIndex: number;
   selectedMinutes: number;
+  durationMs: number;
   targetAt: number | null;
   pausedRemainingMs: number | null;
   stopwatchStartedAt: number | null;
@@ -74,6 +75,7 @@ const defaultSession = (): Session => ({
   mode: "selecting",
   selectedIndex: 13,
   selectedMinutes: 13,
+  durationMs: 13 * 60_000,
   targetAt: null,
   pausedRemainingMs: null,
   stopwatchStartedAt: null,
@@ -104,6 +106,19 @@ registerServiceWorker();
 syncWakeLock();
 
 function loadSession(): Session {
+  const durationOverrideSeconds = getDurationOverrideSeconds();
+  if (durationOverrideSeconds !== null) {
+    const durationMs = durationOverrideSeconds * 1000;
+    return {
+      ...defaultSession(),
+      mode: "timer_running",
+      selectedIndex: clamp(Math.ceil(durationOverrideSeconds / 60), MIN_INDEX, MAX_INDEX),
+      selectedMinutes: durationOverrideSeconds / 60,
+      durationMs,
+      targetAt: Date.now() + durationMs
+    };
+  }
+
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
@@ -130,6 +145,10 @@ function loadSession(): Session {
       mode,
       selectedIndex,
       selectedMinutes: selectedIndexToMinutes(selectedIndex),
+      durationMs:
+        typeof snapshot.durationMs === "number"
+          ? snapshot.durationMs
+          : selectedIndexToDurationMs(selectedIndex),
       targetAt,
       pausedRemainingMs:
         typeof snapshot.pausedRemainingMs === "number" ? snapshot.pausedRemainingMs : null,
@@ -144,6 +163,16 @@ function loadSession(): Session {
   } catch {
     return defaultSession();
   }
+}
+
+function getDurationOverrideSeconds() {
+  const value = new URLSearchParams(window.location.search).get("duration");
+  if (value === null) {
+    return null;
+  }
+
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
 }
 
 function normalizeMode(value: unknown): Mode {
@@ -447,6 +476,7 @@ function moveSelection(direction: number) {
     mode: "selecting",
     selectedIndex: next,
     selectedMinutes: selectedIndexToMinutes(next),
+    durationMs: selectedIndexToDurationMs(next),
     targetAt: null,
     pausedRemainingMs: null,
     stopwatchStartedAt: null,
@@ -486,6 +516,7 @@ function activate() {
         ...session,
         mode: "stopwatch_running",
         selectedMinutes: 0,
+        durationMs: 0,
         stopwatchStartedAt: now,
         stopwatchElapsedMs: 0,
         targetAt: null,
@@ -496,7 +527,8 @@ function activate() {
         ...session,
         mode: "timer_running",
         selectedMinutes: session.selectedIndex,
-        targetAt: now + session.selectedIndex * 60_000,
+        durationMs: selectedIndexToDurationMs(session.selectedIndex),
+        targetAt: now + selectedIndexToDurationMs(session.selectedIndex),
         pausedRemainingMs: null,
         stopwatchStartedAt: null,
         stopwatchElapsedMs: 0
@@ -526,7 +558,7 @@ function activate() {
   }
 
   if (session.mode === "timer_paused") {
-    const pausedRemainingMs = session.pausedRemainingMs ?? session.selectedMinutes * 60_000;
+    const pausedRemainingMs = session.pausedRemainingMs ?? session.durationMs;
     if (pausedRemainingMs <= 0) {
       session = {
         ...session,
@@ -589,7 +621,8 @@ function resetToSelecting() {
   session = {
     ...defaultSession(),
     selectedIndex,
-    selectedMinutes: selectedIndexToMinutes(selectedIndex)
+    selectedMinutes: selectedIndexToMinutes(selectedIndex),
+    durationMs: selectedIndexToDurationMs(selectedIndex)
   };
   app.classList.add("resetting");
   window.setTimeout(() => app.classList.remove("resetting"), 320);
@@ -620,7 +653,7 @@ function updateWheelSelectionSuppression() {
 
 function getResetSelectedIndex() {
   if (session.mode === "timer_paused") {
-    const remainingMs = session.pausedRemainingMs ?? session.selectedMinutes * 60_000;
+    const remainingMs = session.pausedRemainingMs ?? session.durationMs;
     if (remainingMs > 0) {
       return clamp(Math.ceil(Math.floor(remainingMs / 1000) / 60), 1, MAX_INDEX);
     }
@@ -794,7 +827,7 @@ function getDisplay(now: number): Display {
 
   const remainingMs =
     session.mode === "timer_paused"
-      ? session.pausedRemainingMs ?? session.selectedMinutes * 60_000
+      ? session.pausedRemainingMs ?? session.durationMs
       : getTimerRemainingMs(now);
 
   if (session.mode === "timer_running" && remainingMs <= 0) {
@@ -810,8 +843,8 @@ function getDisplay(now: number): Display {
     return getDisplay(now);
   }
 
-  const durationSeconds = session.selectedMinutes * 60;
-  const remainingSeconds = Math.min(durationSeconds - 1, Math.floor(remainingMs / 1000));
+  const durationSeconds = Math.ceil(session.durationMs / 1000);
+  const remainingSeconds = clamp(Math.ceil(remainingMs / 1000), 0, durationSeconds);
   const hero =
     remainingMs < 60_000 ? String(Math.max(1, remainingSeconds)) : String(Math.ceil(remainingSeconds / 60));
   const label = formatDuration(remainingSeconds);
@@ -829,7 +862,7 @@ function getDisplay(now: number): Display {
 
 function getTimerRemainingMs(now: number) {
   if (typeof session.targetAt !== "number") {
-    return session.pausedRemainingMs ?? session.selectedMinutes * 60_000;
+    return session.pausedRemainingMs ?? session.durationMs;
   }
 
   return session.targetAt - now;
@@ -841,6 +874,10 @@ function getStopwatchElapsedMs(now: number) {
 
 function selectedIndexToMinutes(index: number) {
   return index === 0 ? 0 : index;
+}
+
+function selectedIndexToDurationMs(index: number) {
+  return selectedIndexToMinutes(index) * 60_000;
 }
 
 function formatDuration(totalSeconds: number) {

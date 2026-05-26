@@ -228,26 +228,6 @@ select {
   transform: translateX(-50%) translateY(0) scale(1);
 }
 
-[data-overtime="true"] .focus-stage {
-  background:
-    radial-gradient(circle at 50% 43%, rgba(255, 107, 74, 0.3), transparent 21rem),
-    radial-gradient(circle at 50% 105%, rgba(216, 66, 101, 0.33), transparent 28rem),
-    linear-gradient(180deg, #211318 0%, #090608 58%, #020203 100%);
-}
-
-[data-overtime="true"] .focus-number {
-  color: #fff0d2;
-  text-shadow:
-    0 0.018em 0 #ff4f4a,
-    0 0.055em 0 #812340,
-    0 0.125em 0.22em rgba(0, 0, 0, 0.66),
-    0 0 0.2em rgba(255, 107, 74, 0.18);
-}
-
-[data-overtime="true"] .sub-time {
-  color: #ff725f;
-}
-
 [data-visual="stopwatch"] {
   color-scheme: light;
 }

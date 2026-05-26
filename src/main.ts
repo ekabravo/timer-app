@@ -4,7 +4,6 @@ type Mode =
   | "selecting"
   | "timer_running"
   | "timer_paused"
-  | "timer_overtime"
   | "stopwatch_running"
   | "stopwatch_paused";
 
@@ -120,32 +119,42 @@ function loadSession(): Session {
     const selectedIndex = Number.isFinite(parsedIndex)
       ? clamp(parsedIndex, MIN_INDEX, MAX_INDEX)
       : 13;
+    const storedMode = snapshot.mode as unknown;
+    const mode = normalizeMode(storedMode);
+    const isLegacyOvertime = storedMode === "timer_overtime";
+    const targetAt = typeof snapshot.targetAt === "number" ? snapshot.targetAt : null;
+    const stopwatchElapsedMs =
+      typeof snapshot.stopwatchElapsedMs === "number" ? snapshot.stopwatchElapsedMs : 0;
+
     return {
-      mode: isMode(snapshot.mode) ? snapshot.mode : "selecting",
+      mode,
       selectedIndex,
       selectedMinutes: selectedIndexToMinutes(selectedIndex),
-      targetAt: typeof snapshot.targetAt === "number" ? snapshot.targetAt : null,
+      targetAt,
       pausedRemainingMs:
         typeof snapshot.pausedRemainingMs === "number" ? snapshot.pausedRemainingMs : null,
       stopwatchStartedAt:
+        mode === "stopwatch_running" && isLegacyOvertime ? Date.now() :
         typeof snapshot.stopwatchStartedAt === "number" ? snapshot.stopwatchStartedAt : null,
       stopwatchElapsedMs:
-        typeof snapshot.stopwatchElapsedMs === "number" ? snapshot.stopwatchElapsedMs : 0
+        mode === "stopwatch_running" && isLegacyOvertime && targetAt !== null
+          ? Math.max(0, Date.now() - targetAt)
+          : stopwatchElapsedMs
     };
   } catch {
     return defaultSession();
   }
 }
 
-function isMode(value: string): value is Mode {
-  return [
-    "selecting",
-    "timer_running",
-    "timer_paused",
-    "timer_overtime",
-    "stopwatch_running",
-    "stopwatch_paused"
-  ].includes(value);
+function normalizeMode(value: unknown): Mode {
+  if (value === "timer_overtime") {
+    return "stopwatch_running";
+  }
+
+  return ["selecting", "timer_running", "timer_paused", "stopwatch_running", "stopwatch_paused"]
+    .includes(String(value))
+    ? (value as Mode)
+    : "selecting";
 }
 
 function persistSession() {
@@ -495,7 +504,7 @@ function activate() {
     return;
   }
 
-  if (session.mode === "timer_running" || session.mode === "timer_overtime") {
+  if (session.mode === "timer_running") {
     const remainingMs = getTimerRemainingMs(now);
     session = {
       ...session,
@@ -512,9 +521,25 @@ function activate() {
 
   if (session.mode === "timer_paused") {
     const pausedRemainingMs = session.pausedRemainingMs ?? session.selectedMinutes * 60_000;
+    if (pausedRemainingMs <= 0) {
+      session = {
+        ...session,
+        mode: "stopwatch_running",
+        targetAt: null,
+        pausedRemainingMs: null,
+        stopwatchStartedAt: now,
+        stopwatchElapsedMs: Math.abs(pausedRemainingMs)
+      };
+      vibrate(12);
+      persistSession();
+      render();
+      syncWakeLock();
+      return;
+    }
+
     session = {
       ...session,
-      mode: pausedRemainingMs > 0 ? "timer_running" : "timer_overtime",
+      mode: "timer_running",
       targetAt: now + pausedRemainingMs,
       pausedRemainingMs: null
     };
@@ -617,7 +642,6 @@ function render() {
   app.dataset.visual = display.visual;
   app.dataset.focused = String(display.focused);
   app.dataset.paused = String(display.paused);
-  app.dataset.overtime = String(display.overtime);
   app.dataset.wake = wakeLockState;
 
   const renderKey = [
@@ -625,7 +649,6 @@ function render() {
     display.visual,
     display.focused,
     display.paused,
-    display.overtime,
     display.hero,
     display.label,
     display.announcement
@@ -724,7 +747,6 @@ type Display = {
   visual: "timer" | "stopwatch";
   focused: boolean;
   paused: boolean;
-  overtime: boolean;
   hero: string;
   label: string;
   announcement: string;
@@ -738,7 +760,6 @@ function getDisplay(now: number): Display {
       visual: session.selectedIndex === 0 ? "stopwatch" : "timer",
       focused: false,
       paused: false,
-      overtime: false,
       hero: session.selectedIndex === 0 ? "+" : String(session.selectedIndex),
       label: "",
       announcement: `Selected ${value}`
@@ -759,7 +780,6 @@ function getDisplay(now: number): Display {
       visual: "stopwatch",
       focused: true,
       paused: session.mode === "stopwatch_paused",
-      overtime: false,
       hero,
       label,
       announcement: `${label} stopwatch ${session.mode === "stopwatch_paused" ? "paused" : "running"}`
@@ -774,31 +794,20 @@ function getDisplay(now: number): Display {
   if (session.mode === "timer_running" && remainingMs <= 0) {
     session = {
       ...session,
-      mode: "timer_overtime"
+      mode: "stopwatch_running",
+      targetAt: null,
+      pausedRemainingMs: null,
+      stopwatchStartedAt: now,
+      stopwatchElapsedMs: Math.abs(remainingMs)
     };
     persistSession();
+    return getDisplay(now);
   }
 
-  const overtime = remainingMs <= 0 || session.mode === "timer_overtime";
-  const totalSeconds = Math.max(0, Math.floor(Math.abs(remainingMs) / 1000));
-
-  if (overtime) {
-    const label = `+${formatDuration(totalSeconds)}`;
-    return {
-      mode: session.mode === "timer_paused" ? "timer_paused" : "timer_overtime",
-      visual: "timer",
-      focused: true,
-      paused: session.mode === "timer_paused",
-      overtime: true,
-      hero: "0",
-      label,
-      announcement: `${label} overtime ${session.mode === "timer_paused" ? "paused" : "running"}`
-    };
-  }
-
-  const remainingSeconds = Math.floor(remainingMs / 1000);
+  const durationSeconds = session.selectedMinutes * 60;
+  const remainingSeconds = Math.min(durationSeconds - 1, Math.floor(remainingMs / 1000));
   const hero =
-    remainingMs < 60_000 ? String(Math.max(0, remainingSeconds)) : String(Math.ceil(remainingSeconds / 60));
+    remainingMs < 60_000 ? String(Math.max(1, remainingSeconds)) : String(Math.ceil(remainingSeconds / 60));
   const label = formatDuration(remainingSeconds);
 
   return {
@@ -806,7 +815,6 @@ function getDisplay(now: number): Display {
     visual: "timer",
     focused: true,
     paused: session.mode === "timer_paused",
-    overtime: false,
     hero,
     label,
     announcement: `${label} remaining ${session.mode === "timer_paused" ? "paused" : "running"}`
@@ -845,7 +853,7 @@ function isPaused() {
 }
 
 function isRunningMode(mode: Mode) {
-  return mode === "timer_running" || mode === "timer_overtime" || mode === "stopwatch_running";
+  return mode === "timer_running" || mode === "stopwatch_running";
 }
 
 function vibrate(pattern: number | number[]) {
@@ -876,9 +884,7 @@ function startRenderLoop() {
 async function syncWakeLock() {
   const shouldHold =
     document.visibilityState === "visible" &&
-    (session.mode === "timer_running" ||
-      session.mode === "timer_overtime" ||
-      session.mode === "stopwatch_running");
+    (session.mode === "timer_running" || session.mode === "stopwatch_running");
 
   if (!shouldHold) {
     if (wakeLock && !wakeLock.released) {
